@@ -1,6 +1,9 @@
 <launch>
   <!-- Launch Head -->
-  <include file="$(find tracker)/launch/head.launch"/>
+  <!-- <include file="$(find tracker)/launch/head.launch"/> -->
+  <include file="$(find tracker)/launch/tf.launch"/>
+
+  <include file="$(find bender_base)/launch/base.launch"/>
 
   <!-- Launch Asus Camera -->
   <group ns="bender/sensors">
@@ -13,5 +16,5 @@
   </group>
 
   <!-- Run Tracker node -->
-  <node name="tracker" pkg="tracker" type="tracker.py" output="screen" />
+  <node name="tracker" pkg="tracker" type="follow_me.py" output="screen" />
 </launch>

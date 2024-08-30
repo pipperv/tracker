@@ -6,7 +6,7 @@ from tf2_geometry_msgs import do_transform_point
 from sensor_msgs.msg import Image, PointCloud2, JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, Twist
 from dynamixel_workbench_msgs.msg import DynamixelStateList
 from dynamixel_workbench_msgs.srv import DynamixelCommand
 from cv_bridge import CvBridge
@@ -25,19 +25,30 @@ class Tracker():
     
     def __init__(self):
         torch.cuda.set_device(0) # Set device to gpu
-        self.model = YOLO('~/yolov8n-pose.pt') # YOLO model
+        self.model = YOLO('~/yolov8n.pt') # YOLO model
         self.model.to('cuda')
         self.bridge = CvBridge() # CV bridge
         self.track_history = defaultdict(lambda: []) # Store the track history
 
         self.pid = PID(1, 0.1, 0.05, setpoint=0)
-        self.head_srv = rospy.ServiceProxy('/bender/head/dynamixel_command', DynamixelCommand)
+        self.pid_angular = PID(0.5, 0.05, 0.0)
+        self.pid_distance = PID(0.5, 0.0, 0.0)
+        self.following_distance = 0.8
+
+        self.pub_vel = rospy.Publisher('/bender/nav/base/cmd_vel', Twist, queue_size=1)
+
+        # self.head_srv = rospy.ServiceProxy('/bender/head/dynamixel_command', DynamixelCommand)
         rospy.sleep(0.3)
 
         self.current_pan = 512
         self.current_tilt = 490
 
-        self.target_id = 1
+        self.run = False
+        self.searching = False
+        self.goal_reached = False
+        self.stucked = False
+
+        self.target_id = None
         self.dyn_center_pan = 512
         self.dyn_center_tilt = 490
 
@@ -99,21 +110,22 @@ class Tracker():
             # Get the boxes and track IDs
             boxes = results[0].boxes.xywh.cpu()
             track_ids = results[0].boxes.id.int().cpu().tolist()
-            keypoints = results[0].keypoints.xyn.cpu().tolist()
+            #keypoints = results[0].keypoints.xyn.cpu().tolist()
 
             # Visualize the results on the frame
             annotated_frame = results[0].plot()
 
+            print("wadsadsaf")
             # Plot the tracks
             if self.target_id in track_ids:
-                for box, track_id, keypoint in zip(boxes, track_ids, keypoints):
+                for box, track_id in zip(boxes, track_ids):
                         if track_id == self.target_id:
-                            ls_p = keypoint[5] #Right Shoulder Point
-                            rs_p = keypoint[6] #Left Shoulder Point
+                            # ls_p = keypoint[5] #Right Shoulder Point
+                            # rs_p = keypoint[6] #Left Shoulder Point
                             x_b, y_b, w_b, h_b = box
                             track = self.track_history[track_id]
-                            y_t, x_t = self._resolution[0]*(rs_p[1]+ls_p[1])/2.0, self._resolution[1]*(rs_p[0]+ls_p[0])/2.0 # X Track and Y Track
-                            track.append((float(x_t), float(y_t)))  # x, y center point
+                            # y_t, x_t = self._resolution[0]*(rs_p[1]+ls_p[1])/2.0, self._resolution[1]*(rs_p[0]+ls_p[0])/2.0 # X Track and Y Track
+                            track.append((float(x_b), float(y_b)))  # x, y center point
                             if len(track) > 30:  # retain 90 tracks for 90 frames
                                 track.pop(0)
 
@@ -132,22 +144,101 @@ class Tracker():
 
                             self.publish_marker(transformed_point)
 
-                            if 0.0 in [*ls_p,*rs_p]:
-                                self.adjust_neck(x_b, y_b, control_tilt=True)
+                            if self.run:
+                                # self.adjust_neck(x_b, y_b, control_tilt=True)
+                                twist = Twist()
+                                ang_vel = self.calculate_ang_vel(int(x_b.item()))
+                                lin_vel = self.calculate_lin_vel(transformed_point.point.x)
+
+                                twist.angular.z = ang_vel
+                                twist.linear.x = np.float64(lin_vel)
+
+                                self.pub_vel.publish(twist)
                             else:
-                                self.adjust_neck(x_t, y_t, control_tilt=True)
-            elif False:
-                pass
-            else:
+                                twist = Twist()
+
+                                twist.angular.z = 0.0
+                                twist.linear.x = 0.0
+
+                                self.pub_vel.publish(twist)
+
+
+                            # if 0.0 in [*ls_p,*rs_p]:
+                            #     self.adjust_neck(x_b, y_b, control_tilt=True)
+                            # else:
+                            #     self.adjust_neck(x_t, y_t, control_tilt=True)
+            elif self.searching:
+                twist = Twist()
+
+                twist.angular.z = 0.0
+                twist.linear.x = 0.0
+
+                self.pub_vel.publish(twist)
+
                 self.target_id = track_ids[0]
-                self.center_neck()
+            else:
+                twist = Twist()
+
+                twist.angular.z = 0.0
+                twist.linear.x = 0.0
+
+                self.pub_vel.publish(twist)
+
+                # self.target_id = track_ids[0]
+                self.target_id = None
+                # self.center_neck()
+
 
             image_message = self.bridge.cv2_to_imgmsg(annotated_frame, encoding="bgr8")
             self.img_pub.publish(image_message)
 
         except Exception as e:
             print(e)
-            self.center_neck()
+            if self.run:
+                twist = Twist()
+
+                twist.angular.z = 0.0
+                twist.linear.x = 0.0
+
+                self.pub_vel.publish(twist)
+
+                self.target_id = None
+                # self.center_neck()
+            self.target_id = None
+
+    def calculate_ang_vel(self, xc):
+        error = xc - 640//2
+
+        control = self.pid_angular(error)
+
+        ang_vel = 0.01 * control
+
+        if abs(ang_vel) > 1.0:
+            ang_vel = np.sign(ang_vel) * 1.0
+
+        return ang_vel
+
+    def calculate_lin_vel(self, x):
+
+        if np.isnan(x):
+            return 0.0
+
+        error = x - self.following_distance
+
+        lin_vel = error
+
+        print(f'Lineal velocity will be {lin_vel}')
+
+        if lin_vel <= 0:
+            lin_vel = 0.0
+            return lin_vel
+
+        if lin_vel > 0.8:
+            lin_vel = 0.4
+            return lin_vel
+        
+        return lin_vel
+
 
     def dyn_state_callback(self, msg):
         self.current_pan = msg.dynamixel_state[1].present_position
@@ -212,13 +303,45 @@ class Tracker():
         rospy.sleep(0.1)
 
     def spin(self):
-        rospy.spin()
+        while not rospy.is_shutdown():
+            #Do some other work
+            if self.target_id is None:
+                return
+            rospy.sleep(0.5) #10Hz
+
+    def get_target_id(self):
+        return self.target_id
+    
+    def set_target_id(self, id):
+        self.target_id = id
+    
+    def start(self):
+        self.run = True
+
+    def stop(self):
+        self.run = False
+
+    def start_search(self):
+        self.searching = True
+
+    def stop_search(self):
+        self.searching = False
+
+    def is_goal_reached(self):
+        return self.goal_reached
+    
+    def nav_failed(self):
+        return self.stucked
 
 if __name__ == '__main__':
     # Initialize the ROS node
     rospy.init_node('tracker', anonymous=True)
     try:
         tracker = Tracker()
+
+        tracker.set_target_id(0)
+
+        tracker.start()
         
         tracker.spin()
     except rospy.ROSInterruptException:
